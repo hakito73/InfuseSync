@@ -1,0 +1,38 @@
+name: Validate Jellyfin 12 build
+
+on:
+  push:
+    branches:
+      - agent/jellyfin-12-support
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish Jellyfin plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore Jellyfin project
+        run: dotnet restore InfuseSync/InfuseSync.Jellyfin.csproj
+
+      - name: Publish Jellyfin plugin
+        run: dotnet publish InfuseSync/InfuseSync.Jellyfin.csproj --configuration Release --no-restore
+
+      - name: Upload plugin DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: InfuseSync-Jellyfin-12
+          path: InfuseSync/bin/jellyfin/Release/net10.0/publish/InfuseSync.dll
+          if-no-files-found: error
