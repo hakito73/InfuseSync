@@ -268,7 +268,12 @@ namespace InfuseSync.API
             var items = GetUserItems(user, itemsUpdated);
 
             var options = new DtoOptions { Fields = request.GetItemFields() };
-            var itemDtos = _dtoService.GetBaseItemDtos(items, options, user);
+            var itemDtos = _dtoService.GetBaseItemDtos(
+                items,
+                options,
+                user,
+                owner: null,
+                skipVisibilityCheck: false);
 
             return new QueryResult<BaseItemDto> {
                 Items = itemDtos,
