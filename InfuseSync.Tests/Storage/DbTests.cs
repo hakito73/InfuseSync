@@ -17,7 +17,7 @@ public sealed class DbTests : IDisposable
             Path.GetTempPath(),
             "InfuseSync.Tests",
             Guid.NewGuid().ToString("N"));
-        _database = new TestDb(_databaseDirectory);
+        _database = new TestDb(_databaseDirectory, () => 1000);
     }
 
     [Fact]
@@ -146,8 +146,9 @@ public sealed class DbTests : IDisposable
     }
 
     [Fact]
-    public async Task SaveNow_AssignsTimestampsAfterAcquiringTheWriteLock()
+    public async Task WatermarkOperationsAreSerializedByTheWriteLock()
     {
+        var checkpoint = _database.CreateCheckpoint("living-room", "user-1");
         var items = new[]
         {
             Item(Guid.NewGuid(), "Movie", ItemStatus.Updated, 0),
@@ -161,29 +162,105 @@ public sealed class DbTests : IDisposable
         var heldLock = _database.HoldWriteLock();
         Task saveItems = null;
         Task saveUserInfo = null;
+        Task<Checkpoint> startSync = null;
 
         try
         {
             saveItems = Task.Run(() => _database.SaveItemsNow(items));
             saveUserInfo = Task.Run(() => _database.SaveUserInfoNow(userInfo));
+            startSync = Task.Run(() => _database.StartSync(checkpoint.Guid));
 
-            Assert.True(SpinWait.SpinUntil(() => _database.WaitingWriters == 2, TimeSpan.FromSeconds(5)));
+            Assert.True(SpinWait.SpinUntil(() => _database.WaitingWriters == 3, TimeSpan.FromSeconds(5)));
             Assert.All(items, item => Assert.Equal(0, item.LastModified));
             Assert.All(userInfo, info => Assert.Equal(0, info.LastModified));
         }
         finally
         {
             heldLock.Dispose();
-            if (saveItems != null && saveUserInfo != null)
+            if (saveItems != null && saveUserInfo != null && startSync != null)
             {
-                await Task.WhenAll(saveItems, saveUserInfo);
+                await Task.WhenAll(saveItems, saveUserInfo, startSync);
             }
         }
 
-        Assert.All(items, item => Assert.NotEqual(0, item.LastModified));
-        Assert.All(userInfo, info => Assert.NotEqual(0, info.LastModified));
         Assert.Equal(items[0].LastModified, items[1].LastModified);
         Assert.Equal(userInfo[0].LastModified, userInfo[1].LastModified);
+        var watermarks = new[]
+        {
+            items[0].LastModified,
+            userInfo[0].LastModified,
+            (await startSync).SyncTimestamp.Value
+        }.OrderBy(value => value).ToArray();
+        Assert.Equal(new long[] { 1001, 1002, 1003 }, watermarks);
+    }
+
+    [Fact]
+    public void FailedWriteRollsBackItsWatermark()
+    {
+        var checkpoint = _database.CreateCheckpoint("living-room", "user-1");
+        var invalid = Item(Guid.NewGuid(), null, ItemStatus.Updated, 0);
+        Assert.ThrowsAny<Exception>(() => _database.SaveItemsNow(new[] { invalid }));
+
+        var valid = Item(Guid.NewGuid(), "Movie", ItemStatus.Updated, 0);
+        _database.SaveItemsNow(new[] { valid });
+        _database.StartSync(checkpoint.Guid);
+
+        Assert.Equal(1001, invalid.LastModified);
+        Assert.Equal(1001, valid.LastModified);
+        Assert.Equal(1, _database.ItemsCount(checkpoint.Guid, ItemStatus.Updated, null));
+    }
+
+    [Fact]
+    public void WatermarkSurvivesClockChangesAcrossAllOperations()
+    {
+        var clock = new MutableClock(1000);
+        var path = Path.Combine(_databaseDirectory, "clock-changes");
+        using var database = new TestDb(path, () => clock.Value);
+
+        var checkpoint = database.CreateCheckpoint("living-room", "user-1");
+        clock.Value = 900;
+        var item = Item(Guid.NewGuid(), "Movie", ItemStatus.Updated, 0);
+        database.SaveItemsNow(new[] { item });
+        clock.Value = 5000;
+        var syncTimestamp = database.StartSync(checkpoint.Guid).SyncTimestamp.Value;
+        clock.Value = 4000;
+        var userInfo = UserInfo(Guid.NewGuid(), "user-1", 0);
+        database.SaveUserInfoNow(new[] { userInfo });
+
+        Assert.Equal(1000, checkpoint.Timestamp);
+        Assert.Equal(1001, item.LastModified);
+        Assert.Equal(5000, syncTimestamp);
+        Assert.Equal(5001, userInfo.LastModified);
+    }
+
+    [Fact]
+    public void WatermarkPersistsAndCanBeRebuiltFromExistingRows()
+    {
+        var path = Path.Combine(_databaseDirectory, "restart");
+        var item = Item(Guid.NewGuid(), "Movie", ItemStatus.Updated, 0);
+        using (var database = new TestDb(path, () => 1000))
+        {
+            database.SaveItemsNow(new[] { item });
+        }
+
+        var databasePath = Path.Combine(path, "infuse_sync.db");
+        using (var connection = new SqliteConnection($"Data Source={databasePath}"))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "select Value from sync_watermark where Id=1;";
+            Assert.Equal(1000L, (long)command.ExecuteScalar());
+            command.CommandText = "drop table sync_watermark;";
+            command.ExecuteNonQuery();
+        }
+
+        var userInfo = UserInfo(Guid.NewGuid(), "user-1", 0);
+        using (var database = new TestDb(path, () => 10))
+        {
+            database.SaveUserInfoNow(new[] { userInfo });
+        }
+
+        Assert.Equal(1001, userInfo.LastModified);
     }
 
     public void Dispose()
@@ -213,8 +290,8 @@ public sealed class DbTests : IDisposable
 
     private sealed class TestDb : Db
     {
-        public TestDb(string path)
-            : base(path, NullLogger.Instance)
+        public TestDb(string path, Func<long> utcFileTime)
+            : base(path, NullLogger.Instance, utcFileTime)
         {
         }
 
@@ -224,5 +301,15 @@ public sealed class DbTests : IDisposable
         {
             return WriteLock.Write();
         }
+    }
+
+    private sealed class MutableClock
+    {
+        public MutableClock(long value)
+        {
+            Value = value;
+        }
+
+        public long Value { get; set; }
     }
 }
