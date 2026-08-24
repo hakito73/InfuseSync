@@ -201,7 +201,11 @@ namespace InfuseSync.Storage
                 using (var connection = CreateConnection(true))
                 {
                     var condition = ItemsCondition(itemTypes);
-                    var sql = $"select * from {ItemsTable} where {condition} limit @Limit OFFSET @Offset;";
+#if EMBY
+                    var sql = $"select * from {ItemsTable} where {condition} order by LastModified, Id limit @Limit OFFSET @Offset;";
+#else
+                    var sql = $"select * from {ItemsTable} where {condition} order by LastModified, Guid limit @Limit OFFSET @Offset;";
+#endif
 
                     using (var statement = connection.PrepareStatement(sql))
                     {
@@ -295,7 +299,11 @@ namespace InfuseSync.Storage
                 using (var connection = CreateConnection(true))
                 {
                     var condition = UserInfoCondition(itemTypes);
-                    var sql = $"select * from {UserInfoTable} where {condition} limit @Limit OFFSET @Offset;";
+#if EMBY
+                    var sql = $"select * from {UserInfoTable} where {condition} order by LastModified, Id limit @Limit OFFSET @Offset;";
+#else
+                    var sql = $"select * from {UserInfoTable} where {condition} order by LastModified, Guid limit @Limit OFFSET @Offset;";
+#endif
 
                     using (var statement = connection.PrepareStatement(sql))
                     {
