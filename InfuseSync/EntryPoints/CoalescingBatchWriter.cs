@@ -8,26 +8,34 @@ namespace InfuseSync.EntryPoints
 {
     internal sealed class BatchStopResult
     {
-        public BatchStopResult(Exception error, int unsavedCount, int attempts)
-            => (Error, UnsavedCount, Attempts) = (error, unsavedCount, attempts);
+        public BatchStopResult(
+            Exception error,
+            int unsavedCount,
+            int attempts,
+            bool isFinal = true)
+            => (Error, UnsavedCount, Attempts, IsFinal) =
+                (error, unsavedCount, attempts, isFinal);
 
         public bool Succeeded => Error == null;
         public Exception Error { get; }
         public int UnsavedCount { get; }
         public int Attempts { get; }
+        public bool IsFinal { get; }
     }
 
     internal sealed class CoalescingBatchWriter<TKey, TValue>
     {
         private const int ShutdownWriteAttempts = 3;
+        internal static readonly TimeSpan MaximumTimerDelay =
+            TimeSpan.FromMilliseconds(uint.MaxValue - 2d);
 
         private sealed class Batch
         {
-            public Batch(Dictionary<TKey, TValue> items, DateTime startedAtUtc)
-                => (Items, StartedAtUtc) = (items, startedAtUtc);
+            public Batch(Dictionary<TKey, TValue> items, long startedAt)
+                => (Items, StartedAt) = (items, startedAt);
 
             public Dictionary<TKey, TValue> Items { get; }
-            public DateTime StartedAtUtc { get; }
+            public long StartedAt { get; }
         }
 
         private readonly object _syncLock = new object();
@@ -37,14 +45,19 @@ namespace InfuseSync.EntryPoints
         private readonly Func<TValue, TValue, TValue> _merge;
         private readonly Action<IReadOnlyCollection<TValue>> _writeBatch;
         private readonly Action<Exception, int> _writeError;
+        private readonly Func<long> _getTimestamp;
+        private readonly long _timestampFrequency;
         private readonly Timer _timer;
 
         private Dictionary<TKey, TValue> _pending = new Dictionary<TKey, TValue>();
         private Batch _inFlight;
         private Task<Exception> _activeWrite;
-        private DateTime? _batchStartedAtUtc;
-        private DateTime? _retryNotBeforeUtc;
-        private BatchStopResult _stopResult;
+        private Task<BatchStopResult> _drainTask;
+        private BatchStopResult _finalStopResult;
+        private long? _batchStartedAt;
+        private long? _retryStartedAt;
+        private TimeSpan? _scheduledDelay;
+        private int _drainAttempts;
         private bool _isStopping;
 
         public CoalescingBatchWriter(
@@ -54,14 +67,46 @@ namespace InfuseSync.EntryPoints
             Func<TValue, TValue, TValue> merge,
             Action<IReadOnlyCollection<TValue>> writeBatch,
             Action<Exception, int> writeError)
+            : this(
+                debounceDelay,
+                maximumDelay,
+                retryDelay,
+                merge,
+                writeBatch,
+                writeError,
+                Stopwatch.GetTimestamp,
+                Stopwatch.Frequency)
         {
+        }
+
+        internal CoalescingBatchWriter(
+            TimeSpan debounceDelay,
+            TimeSpan maximumDelay,
+            TimeSpan retryDelay,
+            Func<TValue, TValue, TValue> merge,
+            Action<IReadOnlyCollection<TValue>> writeBatch,
+            Action<Exception, int> writeError,
+            Func<long> getTimestamp,
+            long timestampFrequency)
+        {
+            if (timestampFrequency <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(timestampFrequency));
+            }
+
             _debounceDelay = debounceDelay;
             _maximumDelay = maximumDelay;
             _retryDelay = retryDelay;
             _merge = merge ?? throw new ArgumentNullException(nameof(merge));
             _writeBatch = writeBatch ?? throw new ArgumentNullException(nameof(writeBatch));
             _writeError = writeError ?? throw new ArgumentNullException(nameof(writeError));
-            _timer = new Timer(_ => StartWrite(false), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            _getTimestamp = getTimestamp ?? throw new ArgumentNullException(nameof(getTimestamp));
+            _timestampFrequency = timestampFrequency;
+            _timer = new Timer(
+                _ => StartWrite(false, true, false),
+                null,
+                Timeout.InfiniteTimeSpan,
+                Timeout.InfiniteTimeSpan);
         }
 
         internal int PendingCount
@@ -72,6 +117,24 @@ namespace InfuseSync.EntryPoints
         internal int OutstandingCount
         {
             get { lock (_syncLock) return GetOutstandingCount(); }
+        }
+
+        internal Task<BatchStopResult> DeferredStop
+        {
+            get { lock (_syncLock) return _drainTask; }
+        }
+
+        internal TimeSpan? ScheduledDelay
+        {
+            get { lock (_syncLock) return _scheduledDelay; }
+        }
+
+        internal TimeSpan DelayAt(long timestamp)
+        {
+            lock (_syncLock)
+            {
+                return CalculateNextFlushDelay(timestamp);
+            }
         }
 
         public bool Enqueue(TKey key, TValue value)
@@ -86,8 +149,8 @@ namespace InfuseSync.EntryPoints
                 }
 
                 _pending[key] = value;
-                var now = DateTime.UtcNow;
-                _batchStartedAtUtc = _batchStartedAtUtc ?? now;
+                var now = _getTimestamp();
+                _batchStartedAt = _batchStartedAt ?? now;
                 if (_activeWrite == null)
                 {
                     ScheduleNextFlush(now);
@@ -99,7 +162,7 @@ namespace InfuseSync.EntryPoints
 
         internal bool FlushNow()
         {
-            var write = StartWrite(true);
+            var write = StartWrite(false, false, false);
             return write == null ? OutstandingCount == 0 : write.GetAwaiter().GetResult() == null;
         }
 
@@ -110,114 +173,145 @@ namespace InfuseSync.EntryPoints
                 throw new ArgumentOutOfRangeException(nameof(timeout));
             }
 
-            bool activeWriteAtStart;
+            var elapsed = Stopwatch.StartNew();
+            TaskCompletionSource<BatchStopResult> drainSource = null;
+            Task<Exception> initialWrite = null;
+            Task<BatchStopResult> drainTask;
             lock (_syncLock)
             {
-                if (_stopResult != null)
+                if (_drainTask == null)
                 {
-                    return _stopResult;
+                    _isStopping = true;
+                    CancelTimer();
+                    initialWrite = _activeWrite;
+                    _drainAttempts = initialWrite == null ? 0 : 1;
+                    drainSource = new TaskCompletionSource<BatchStopResult>(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    _drainTask = drainSource.Task;
                 }
 
-                if (_isStopping)
-                {
-                    return new BatchStopResult(
-                        new InvalidOperationException("Batch shutdown is already in progress."),
-                        GetOutstandingCount(),
-                        0);
-                }
-
-                _isStopping = true;
-                CancelTimer();
-                activeWriteAtStart = _activeWrite != null;
+                drainTask = _drainTask;
             }
 
-            var elapsed = Stopwatch.StartNew();
+            if (drainSource != null)
+            {
+                _ = CompleteDrainAsync(drainSource, initialWrite);
+            }
+
+            return WaitForDrain(drainTask, elapsed, timeout, cancellationToken);
+        }
+
+        private BatchStopResult WaitForDrain(
+            Task<BatchStopResult> drainTask,
+            Stopwatch elapsed,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            if (drainTask.IsCompleted)
+            {
+                return drainTask.GetAwaiter().GetResult();
+            }
+
+            var remaining = timeout - elapsed.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                return CreateProvisionalResult(
+                    new TimeoutException("Timed out while draining pending batch writes."));
+            }
+
+            try
+            {
+                var waitMilliseconds = ToWaitMilliseconds(remaining);
+                if (drainTask.Wait(waitMilliseconds, cancellationToken))
+                {
+                    return drainTask.GetAwaiter().GetResult();
+                }
+
+                return CreateProvisionalResult(
+                    new TimeoutException("Timed out while draining pending batch writes."));
+            }
+            catch (OperationCanceledException exception)
+            {
+                return CreateProvisionalResult(exception);
+            }
+        }
+
+        private BatchStopResult CreateProvisionalResult(Exception error)
+        {
+            lock (_syncLock)
+            {
+                return _finalStopResult ?? new BatchStopResult(
+                    error,
+                    GetOutstandingCount(),
+                    _drainAttempts,
+                    false);
+            }
+        }
+
+        private async Task CompleteDrainAsync(
+            TaskCompletionSource<BatchStopResult> drainSource,
+            Task<Exception> initialWrite)
+        {
+            BatchStopResult result;
+            try
+            {
+                result = await DrainAsync(initialWrite).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                result = FinishDrain(exception);
+            }
+
+            drainSource.TrySetResult(result);
+        }
+
+        private async Task<BatchStopResult> DrainAsync(Task<Exception> activeWrite)
+        {
             Exception lastError = null;
-            var attempts = activeWriteAtStart ? 1 : 0;
             var shutdownAttempts = 0;
 
             while (true)
             {
-                Task<Exception> activeWrite;
+                if (activeWrite != null)
+                {
+                    lastError = await activeWrite.ConfigureAwait(false);
+                    activeWrite = null;
+                }
+
                 bool hasPending;
                 lock (_syncLock)
                 {
-                    activeWrite = _activeWrite;
                     hasPending = _pending.Count > 0;
-                }
-
-                if (activeWrite != null)
-                {
-                    var waitError = WaitFor(activeWrite, elapsed, timeout, cancellationToken);
-                    if (waitError != null)
-                    {
-                        return CompleteStop(waitError, attempts);
-                    }
-
-                    lastError = activeWrite.GetAwaiter().GetResult();
-                    continue;
                 }
 
                 if (!hasPending)
                 {
-                    return CompleteStop(null, attempts);
+                    return FinishDrain(null);
                 }
 
                 if (shutdownAttempts == ShutdownWriteAttempts)
                 {
-                    return CompleteStop(lastError, attempts);
+                    return FinishDrain(lastError);
                 }
 
-                if (cancellationToken.IsCancellationRequested)
+                activeWrite = StartWrite(true, false, true);
+                if (activeWrite != null)
                 {
-                    return CompleteStop(new OperationCanceledException(cancellationToken), attempts);
-                }
-
-                if (elapsed.Elapsed >= timeout)
-                {
-                    return CompleteStop(new TimeoutException("Timed out while saving the pending batch."), attempts);
-                }
-
-                if (StartWrite(true) != null)
-                {
-                    attempts++;
                     shutdownAttempts++;
                 }
             }
         }
 
-        private static Exception WaitFor(
-            Task task,
-            Stopwatch elapsed,
-            TimeSpan timeout,
-            CancellationToken cancellationToken)
+        private BatchStopResult FinishDrain(Exception error)
         {
-            var remaining = timeout - elapsed.Elapsed;
-            if (remaining <= TimeSpan.Zero)
-            {
-                return new TimeoutException("Timed out while waiting for the active batch write.");
-            }
-
-            try
-            {
-                var waitMilliseconds = (int)Math.Min(
-                    Math.Ceiling(remaining.TotalMilliseconds),
-                    int.MaxValue);
-                return task.Wait(waitMilliseconds, cancellationToken)
-                    ? null
-                    : new TimeoutException("Timed out while waiting for the active batch write.");
-            }
-            catch (OperationCanceledException exception)
-            {
-                return exception;
-            }
-        }
-
-        private BatchStopResult CompleteStop(Exception error, int attempts)
-        {
-            bool disposeTimer;
+            BatchStopResult result;
             lock (_syncLock)
             {
+                if (_finalStopResult != null)
+                {
+                    return _finalStopResult;
+                }
+
                 var unsavedCount = GetOutstandingCount();
                 if (unsavedCount == 0)
                 {
@@ -228,39 +322,47 @@ namespace InfuseSync.EntryPoints
                     error = new InvalidOperationException("The pending batch could not be saved.");
                 }
 
-                _stopResult = new BatchStopResult(error, unsavedCount, attempts);
-                disposeTimer = _activeWrite == null;
+                result = new BatchStopResult(error, unsavedCount, _drainAttempts);
+                _finalStopResult = result;
+                _scheduledDelay = null;
             }
 
-            if (disposeTimer)
-            {
-                _timer.Dispose();
-            }
-
-            return _stopResult;
+            _timer.Dispose();
+            return result;
         }
 
-        private Task<Exception> StartWrite(bool allowDuringStop)
+        private Task<Exception> StartWrite(
+            bool allowDuringStop,
+            bool logError,
+            bool countAsDrainAttempt)
         {
             Batch snapshot;
             TaskCompletionSource<Exception> completion;
             lock (_syncLock)
             {
-                if (_stopResult != null || (!allowDuringStop && _isStopping) || _pending.Count == 0 || _activeWrite != null)
+                if (_finalStopResult != null ||
+                    (!allowDuringStop && _isStopping) ||
+                    _pending.Count == 0 ||
+                    _activeWrite != null)
                 {
                     return null;
                 }
 
                 CancelTimer();
-                snapshot = new Batch(_pending, _batchStartedAtUtc ?? DateTime.UtcNow);
+                snapshot = new Batch(_pending, _batchStartedAt ?? _getTimestamp());
                 _inFlight = snapshot;
                 _pending = new Dictionary<TKey, TValue>();
-                _batchStartedAtUtc = null;
-                completion = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _batchStartedAt = null;
+                completion = new TaskCompletionSource<Exception>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
                 _activeWrite = completion.Task;
+                if (countAsDrainAttempt)
+                {
+                    _drainAttempts++;
+                }
             }
 
-            Task.Run(() => ExecuteWrite(snapshot, completion, !allowDuringStop));
+            Task.Run(() => ExecuteWrite(snapshot, completion, logError));
             return completion.Task;
         }
 
@@ -279,37 +381,30 @@ namespace InfuseSync.EntryPoints
                 error = exception;
             }
 
-            bool disposeTimer;
             int outstandingCount;
             lock (_syncLock)
             {
                 if (error == null)
                 {
-                    _retryNotBeforeUtc = null;
+                    _retryStartedAt = null;
                 }
                 else
                 {
                     Requeue(snapshot);
-                    _retryNotBeforeUtc = DateTime.UtcNow.Add(_retryDelay);
+                    _retryStartedAt = _getTimestamp();
                 }
 
                 _inFlight = null;
-                _activeWrite = null;
-                disposeTimer = _stopResult != null;
-                if (!disposeTimer && !_isStopping && _pending.Count > 0)
+                if (!_isStopping && _pending.Count > 0)
                 {
-                    ScheduleNextFlush(DateTime.UtcNow);
+                    ScheduleNextFlush(_getTimestamp());
                 }
 
                 outstandingCount = GetOutstandingCount();
+                completion.SetResult(error);
+                _activeWrite = null;
             }
 
-            if (disposeTimer)
-            {
-                _timer.Dispose();
-            }
-
-            completion.SetResult(error);
             if (logError && error != null)
             {
                 try
@@ -332,9 +427,9 @@ namespace InfuseSync.EntryPoints
                     : item.Value;
             }
 
-            if (!_batchStartedAtUtc.HasValue || snapshot.StartedAtUtc < _batchStartedAtUtc.Value)
+            if (!_batchStartedAt.HasValue || snapshot.StartedAt < _batchStartedAt.Value)
             {
-                _batchStartedAtUtc = snapshot.StartedAtUtc;
+                _batchStartedAt = snapshot.StartedAt;
             }
         }
 
@@ -357,25 +452,70 @@ namespace InfuseSync.EntryPoints
             return count;
         }
 
-        private void ScheduleNextFlush(DateTime now)
+        private void ScheduleNextFlush(long now)
         {
-            var maximumRemaining = _maximumDelay - (now - (_batchStartedAtUtc ?? now));
-            var delay = maximumRemaining < _debounceDelay ? maximumRemaining : _debounceDelay;
-            if (delay < TimeSpan.Zero)
-            {
-                delay = TimeSpan.Zero;
-            }
-
-            if (_retryNotBeforeUtc.HasValue && _retryNotBeforeUtc.Value - now > delay)
-            {
-                delay = _retryNotBeforeUtc.Value - now;
-            }
-
+            var delay = CalculateNextFlushDelay(now);
+            _scheduledDelay = delay;
             _timer.Change(delay, Timeout.InfiniteTimeSpan);
+        }
+
+        private TimeSpan CalculateNextFlushDelay(long now)
+        {
+            var maximumRemaining = Remaining(
+                _maximumDelay,
+                Elapsed(_batchStartedAt ?? now, now));
+            var delay = maximumRemaining < _debounceDelay
+                ? maximumRemaining
+                : _debounceDelay;
+            if (_retryStartedAt.HasValue)
+            {
+                var retryRemaining = Remaining(
+                    _retryDelay,
+                    Elapsed(_retryStartedAt.Value, now));
+                if (retryRemaining > delay)
+                {
+                    delay = retryRemaining;
+                }
+            }
+
+            delay = ClampTimerDelay(delay);
+            return delay;
+        }
+
+        private TimeSpan Elapsed(long startedAt, long now)
+        {
+            if (now <= startedAt)
+            {
+                return TimeSpan.Zero;
+            }
+
+            var seconds = ((double)now - startedAt) / _timestampFrequency;
+            return seconds >= TimeSpan.MaxValue.TotalSeconds
+                ? TimeSpan.MaxValue
+                : TimeSpan.FromSeconds(seconds);
+        }
+
+        private static TimeSpan Remaining(TimeSpan duration, TimeSpan elapsed)
+        {
+            return duration <= TimeSpan.Zero || elapsed >= duration
+                ? TimeSpan.Zero
+                : duration - elapsed;
+        }
+
+        private static TimeSpan ClampTimerDelay(TimeSpan delay)
+        {
+            if (delay <= TimeSpan.Zero) return TimeSpan.Zero;
+            return delay > MaximumTimerDelay ? MaximumTimerDelay : delay;
+        }
+
+        private static int ToWaitMilliseconds(TimeSpan timeout)
+        {
+            return (int)Math.Min(Math.Ceiling(timeout.TotalMilliseconds), int.MaxValue);
         }
 
         private void CancelTimer()
         {
+            _scheduledDelay = null;
             _timer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         }
     }

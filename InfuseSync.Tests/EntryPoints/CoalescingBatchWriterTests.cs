@@ -90,6 +90,161 @@ public sealed class CoalescingBatchWriterTests
     }
 
     [Fact]
+    public async Task LateFailureIsRetriedByDeferredDrain()
+    {
+        using var writeStarted = new ManualResetEventSlim();
+        using var allowWrite = new ManualResetEventSlim();
+        var attempts = 0;
+        var writer = CreateWriter(_ =>
+        {
+            if (Interlocked.Increment(ref attempts) == 1)
+            {
+                writeStarted.Set();
+                allowWrite.Wait(TimeSpan.FromSeconds(5));
+                throw new InvalidOperationException("database unavailable");
+            }
+        });
+        var key = Guid.NewGuid();
+        writer.Enqueue(key, Item(key, ItemStatus.Updated));
+        var activeFlush = Task.Run(() => writer.FlushNow());
+        Assert.True(writeStarted.Wait(TimeSpan.FromSeconds(5)));
+
+        var provisional = writer.StopAndFlush(
+            TimeSpan.FromMilliseconds(100),
+            CancellationToken.None);
+        Assert.False(provisional.IsFinal);
+        Assert.Equal(1, provisional.Attempts);
+        Assert.Equal(1, provisional.UnsavedCount);
+
+        allowWrite.Set();
+        Assert.False(await activeFlush);
+        var final = await writer.DeferredStop;
+
+        Assert.True(final.IsFinal);
+        Assert.True(final.Succeeded);
+        Assert.Equal(2, final.Attempts);
+        Assert.Equal(0, final.UnsavedCount);
+        Assert.Equal(0, writer.PendingCount);
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public async Task LateSuccessUpdatesFinalStopResult()
+    {
+        using var writeStarted = new ManualResetEventSlim();
+        using var allowWrite = new ManualResetEventSlim();
+        var attempts = 0;
+        var writer = CreateWriter(_ =>
+        {
+            Interlocked.Increment(ref attempts);
+            writeStarted.Set();
+            allowWrite.Wait(TimeSpan.FromSeconds(5));
+        });
+        var key = Guid.NewGuid();
+        writer.Enqueue(key, Item(key, ItemStatus.Updated));
+        var activeFlush = Task.Run(() => writer.FlushNow());
+        Assert.True(writeStarted.Wait(TimeSpan.FromSeconds(5)));
+
+        var provisional = writer.StopAndFlush(
+            TimeSpan.FromMilliseconds(100),
+            CancellationToken.None);
+        Assert.False(provisional.IsFinal);
+        Assert.Equal(1, provisional.UnsavedCount);
+
+        allowWrite.Set();
+        Assert.True(await activeFlush);
+        var final = await writer.DeferredStop;
+
+        Assert.True(final.IsFinal);
+        Assert.True(final.Succeeded);
+        Assert.Equal(1, final.Attempts);
+        Assert.Equal(0, final.UnsavedCount);
+        Assert.Equal(1, attempts);
+    }
+
+    [Fact]
+    public async Task ConcurrentStopsUseOwnDeadlinesAndShareFinalDrain()
+    {
+        using var writeStarted = new ManualResetEventSlim();
+        using var allowWrite = new ManualResetEventSlim();
+        var attempts = 0;
+        var writer = CreateWriter(_ =>
+        {
+            Interlocked.Increment(ref attempts);
+            writeStarted.Set();
+            allowWrite.Wait(TimeSpan.FromSeconds(5));
+        });
+        var key = Guid.NewGuid();
+        writer.Enqueue(key, Item(key, ItemStatus.Updated));
+
+        var firstStop = Task.Run(() => Stop(writer));
+        Assert.True(writeStarted.Wait(TimeSpan.FromSeconds(5)));
+        var provisional = writer.StopAndFlush(TimeSpan.Zero, CancellationToken.None);
+        var secondStop = Task.Run(() => Stop(writer));
+        allowWrite.Set();
+        var firstResult = await firstStop;
+        var secondResult = await secondStop;
+
+        Assert.False(provisional.IsFinal);
+        Assert.Equal(1, provisional.Attempts);
+        Assert.Same(firstResult, secondResult);
+        Assert.True(firstResult.Succeeded);
+        Assert.Equal(1, firstResult.Attempts);
+        Assert.Equal(1, attempts);
+    }
+
+    [Fact]
+    public void SchedulingHandlesTimestampRollbackAndLargeForwardJump()
+    {
+        var clock = new MutableClock(100);
+        var attempts = 0;
+        var writer = CreateWriter(
+            _ =>
+            {
+                if (Interlocked.Increment(ref attempts) == 1)
+                {
+                    throw new InvalidOperationException("database unavailable");
+                }
+            },
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromSeconds(5),
+            clock);
+        var key = Guid.NewGuid();
+        writer.Enqueue(key, Item(key, ItemStatus.Updated));
+
+        Assert.False(writer.FlushNow());
+        Assert.Equal(TimeSpan.FromSeconds(5), writer.ScheduledDelay);
+        Assert.Equal(TimeSpan.FromSeconds(5), writer.DelayAt(90));
+        Assert.Equal(TimeSpan.Zero, writer.DelayAt(long.MaxValue));
+
+        var result = Stop(writer);
+        Assert.True(result.Succeeded);
+        Assert.Equal(1, result.Attempts);
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public void ScheduledTimerDelayIsClampedToSupportedRange()
+    {
+        var clock = new MutableClock(0);
+        var writer = CreateWriter(
+            _ => { },
+            TimeSpan.MaxValue,
+            TimeSpan.MaxValue,
+            TimeSpan.MaxValue,
+            clock);
+        var key = Guid.NewGuid();
+
+        writer.Enqueue(key, Item(key, ItemStatus.Updated));
+
+        Assert.Equal(
+            CoalescingBatchWriter<Guid, ItemRec>.MaximumTimerDelay,
+            writer.ScheduledDelay);
+        Assert.True(Stop(writer).Succeeded);
+    }
+
+    [Fact]
     public void StopRetriesTransientFailures()
     {
         var attempts = 0;
@@ -219,7 +374,7 @@ public sealed class CoalescingBatchWriterTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void StopReturnsWithinDeadlineWhenWriterIsBlocked(bool cancel)
+    public async Task StopReturnsWithinDeadlineWhenWriterIsBlocked(bool cancel)
     {
         using var writeStarted = new ManualResetEventSlim();
         using var allowWrite = new ManualResetEventSlim();
@@ -250,6 +405,7 @@ public sealed class CoalescingBatchWriterTests
         {
             Assert.True(writeStarted.IsSet);
             Assert.False(result.Succeeded);
+            Assert.False(result.IsFinal);
             Assert.IsType(cancel ? typeof(OperationCanceledException) : typeof(TimeoutException), result.Error);
             Assert.Equal(1, result.Attempts);
             Assert.Equal(1, result.UnsavedCount);
@@ -265,6 +421,11 @@ public sealed class CoalescingBatchWriterTests
         }
 
         Assert.True(writeFinished.Wait(TimeSpan.FromSeconds(5)));
+        var final = await writer.DeferredStop.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(final.IsFinal);
+        Assert.True(final.Succeeded);
+        Assert.Equal(1, final.Attempts);
+        Assert.Equal(0, final.UnsavedCount);
         Assert.Equal(1, Volatile.Read(ref attempts));
     }
 
@@ -285,6 +446,24 @@ public sealed class CoalescingBatchWriterTests
             (_, _) => { });
     }
 
+    private static CoalescingBatchWriter<Guid, ItemRec> CreateWriter(
+        Action<IReadOnlyCollection<ItemRec>> writeBatch,
+        TimeSpan debounceDelay,
+        TimeSpan maximumDelay,
+        TimeSpan retryDelay,
+        MutableClock clock)
+    {
+        return new CoalescingBatchWriter<Guid, ItemRec>(
+            debounceDelay,
+            maximumDelay,
+            retryDelay,
+            LibrarySyncManager.MergeItemChanges,
+            writeBatch,
+            (_, _) => { },
+            () => clock.Timestamp,
+            1);
+    }
+
     private static ItemRec Item(Guid id, ItemStatus status)
     {
         return new ItemRec
@@ -293,5 +472,15 @@ public sealed class CoalescingBatchWriterTests
             Status = status,
             Type = "Movie"
         };
+    }
+
+    private sealed class MutableClock
+    {
+        public MutableClock(long timestamp)
+        {
+            Timestamp = timestamp;
+        }
+
+        public long Timestamp { get; set; }
     }
 }
