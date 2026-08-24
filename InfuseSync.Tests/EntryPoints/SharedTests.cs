@@ -9,7 +9,7 @@ namespace InfuseSync.Tests.EntryPoints;
 public sealed class SharedTests
 {
     [Fact]
-    public void ResolveUpdatedItem_UsesOwnerBeforeLocalRelationshipIsStored()
+    public void ResolveUpdatedItem_UsesMatchingOwnerAndPrimaryBeforeLocalRelationshipIsStored()
     {
         var primary = new Movie { Id = Guid.NewGuid() };
         var alternate = LocalAlternate(primary.Id);
@@ -22,6 +22,33 @@ public sealed class SharedTests
                 return primary;
             },
             (_, _) => throw new InvalidOperationException("The ownership check should avoid a relationship lookup."));
+
+        Assert.Same(primary, result);
+    }
+
+    [Fact]
+    public void ResolveUpdatedItem_UsesOwnerAsFallbackWhenPrimaryVersionIsMissing()
+    {
+        var primary = new Movie { Id = Guid.NewGuid() };
+        var alternate = new Movie
+        {
+            Id = Guid.NewGuid(),
+            OwnerId = primary.Id
+        };
+
+        var result = Shared.ResolveUpdatedItem(
+            alternate,
+            id =>
+            {
+                Assert.Equal(primary.Id, id);
+                return primary;
+            },
+            (resolvedPrimary, versionId) =>
+            {
+                Assert.Same(primary, resolvedPrimary);
+                Assert.Equal(alternate.Id, versionId);
+                return true;
+            });
 
         Assert.Same(primary, result);
     }
