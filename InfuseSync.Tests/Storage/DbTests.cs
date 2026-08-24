@@ -234,6 +234,28 @@ public sealed class DbTests : IDisposable
     }
 
     [Fact]
+    public void AutomaticStartSyncCreatesAnIdempotentSnapshotAtTheMonotonicCursor()
+    {
+        var checkpoint = _database.CreateCheckpoint("living-room", "user-1");
+        var included = Item(Guid.NewGuid(), "Movie", ItemStatus.Updated, 0);
+        _database.SaveItemsNow(new[] { included });
+
+        var started = _database.StartSync(checkpoint.Guid);
+
+        var excluded = Item(Guid.NewGuid(), "Movie", ItemStatus.Updated, 0);
+        _database.SaveItemsNow(new[] { excluded });
+        var retry = _database.StartSync(checkpoint.Guid);
+        var snapshot = _database.GetItems(checkpoint.Guid, ItemStatus.Updated, null, 0, 10);
+
+        Assert.Equal(1000, checkpoint.Timestamp);
+        Assert.Equal(1001, included.LastModified);
+        Assert.Equal(1002, started.SyncTimestamp);
+        Assert.Equal(started.SyncTimestamp, retry.SyncTimestamp);
+        Assert.Collection(snapshot, item => Assert.Equal(included.Guid, item.Guid));
+        Assert.DoesNotContain(snapshot, item => item.Guid == excluded.Guid);
+    }
+
+    [Fact]
     public void WatermarkPersistsAndCanBeRebuiltFromExistingRows()
     {
         var path = Path.Combine(_databaseDirectory, "restart");
