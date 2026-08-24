@@ -9,7 +9,7 @@ namespace InfuseSync.Tests.Storage;
 public sealed class DbTests : IDisposable
 {
     private readonly string _databaseDirectory;
-    private readonly Db _database;
+    private readonly TestDb _database;
 
     public DbTests()
     {
@@ -17,7 +17,7 @@ public sealed class DbTests : IDisposable
             Path.GetTempPath(),
             "InfuseSync.Tests",
             Guid.NewGuid().ToString("N"));
-        _database = new Db(_databaseDirectory, NullLogger.Instance);
+        _database = new TestDb(_databaseDirectory);
     }
 
     [Fact]
@@ -145,6 +145,47 @@ public sealed class DbTests : IDisposable
         Assert.Collection(secondPage, item => Assert.Equal(thirdId, item.Guid));
     }
 
+    [Fact]
+    public async Task SaveNow_AssignsTimestampsAfterAcquiringTheWriteLock()
+    {
+        var items = new[]
+        {
+            Item(Guid.NewGuid(), "Movie", ItemStatus.Updated, 0),
+            Item(Guid.NewGuid(), "Episode", ItemStatus.Updated, 0)
+        };
+        var userInfo = new[]
+        {
+            UserInfo(Guid.NewGuid(), "user-1", 0),
+            UserInfo(Guid.NewGuid(), "user-1", 0)
+        };
+        var heldLock = _database.HoldWriteLock();
+        Task saveItems = null;
+        Task saveUserInfo = null;
+
+        try
+        {
+            saveItems = Task.Run(() => _database.SaveItemsNow(items));
+            saveUserInfo = Task.Run(() => _database.SaveUserInfoNow(userInfo));
+
+            Assert.True(SpinWait.SpinUntil(() => _database.WaitingWriters == 2, TimeSpan.FromSeconds(5)));
+            Assert.All(items, item => Assert.Equal(0, item.LastModified));
+            Assert.All(userInfo, info => Assert.Equal(0, info.LastModified));
+        }
+        finally
+        {
+            heldLock.Dispose();
+            if (saveItems != null && saveUserInfo != null)
+            {
+                await Task.WhenAll(saveItems, saveUserInfo);
+            }
+        }
+
+        Assert.All(items, item => Assert.NotEqual(0, item.LastModified));
+        Assert.All(userInfo, info => Assert.NotEqual(0, info.LastModified));
+        Assert.Equal(items[0].LastModified, items[1].LastModified);
+        Assert.Equal(userInfo[0].LastModified, userInfo[1].LastModified);
+    }
+
     public void Dispose()
     {
         _database.Dispose();
@@ -169,4 +210,19 @@ public sealed class DbTests : IDisposable
             Type = "Movie",
             LastModified = timestamp
         };
+
+    private sealed class TestDb : Db
+    {
+        public TestDb(string path)
+            : base(path, NullLogger.Instance)
+        {
+        }
+
+        public int WaitingWriters => WriteLock.WaitingWriteCount;
+
+        public IDisposable HoldWriteLock()
+        {
+            return WriteLock.Write();
+        }
+    }
 }
