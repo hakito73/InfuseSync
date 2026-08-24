@@ -169,7 +169,7 @@ namespace InfuseSync.EntryPoints
             if (handlerError != null)
             {
                 _deferredStop = _eventHandlers.ContinueWhenIdle(
-                    () => FlushPending(ShutdownTimeout, CancellationToken.None, true));
+                    () => FlushPendingAndObserve(ShutdownTimeout, true)).Unwrap();
                 _logger.LogError(
                     handlerError,
                     $"User sync shutdown stopped with {_eventHandlers.ActiveCount} active handlers and " +
@@ -184,7 +184,11 @@ namespace InfuseSync.EntryPoints
                 remaining = TimeSpan.Zero;
             }
 
-            FlushPending(remaining, cancellationToken, false);
+            var result = FlushPending(remaining, cancellationToken, false);
+            if (!result.IsFinal)
+            {
+                _deferredStop = ObserveDeferredStop(_pendingUserInfo.DeferredStop);
+            }
         }
 
         private BatchStopResult FlushPending(
@@ -193,6 +197,38 @@ namespace InfuseSync.EntryPoints
             bool deferred)
         {
             var result = _pendingUserInfo.StopAndFlush(timeout, cancellationToken);
+            if (!result.IsFinal)
+            {
+                _logger.LogError(
+                    result.Error,
+                    $"Unable to confirm {result.UnsavedCount} user data changes persisted before the shutdown deadline " +
+                    $"after {result.Attempts} batch write attempts. The final drain is still running.");
+                return result;
+            }
+
+            LogStopResult(result, deferred);
+            return result;
+        }
+
+        private async Task<BatchStopResult> FlushPendingAndObserve(
+            TimeSpan timeout,
+            bool deferred)
+        {
+            var result = FlushPending(timeout, CancellationToken.None, deferred);
+            return result.IsFinal
+                ? result
+                : await ObserveDeferredStop(_pendingUserInfo.DeferredStop).ConfigureAwait(false);
+        }
+
+        private async Task<BatchStopResult> ObserveDeferredStop(Task<BatchStopResult> deferredStop)
+        {
+            var result = await deferredStop.ConfigureAwait(false);
+            LogStopResult(result, true);
+            return result;
+        }
+
+        private void LogStopResult(BatchStopResult result, bool deferred)
+        {
             if (!result.Succeeded)
             {
                 _logger.LogError(
@@ -205,8 +241,6 @@ namespace InfuseSync.EntryPoints
                 _logger.LogDebug(
                     $"Deferred user sync drain completed after {result.Attempts} batch write attempts.");
             }
-
-            return result;
         }
 
 #if EMBY
