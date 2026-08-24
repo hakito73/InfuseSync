@@ -524,7 +524,7 @@ namespace InfuseSync.Storage
                         }
 
                         long? oldestCheckpointTimestamp;
-                        using (var statement = db.PrepareStatement($"select MIN(Timestamp) from {CheckpointsTable};"))
+                        using (var statement = db.PrepareStatement($"select MIN(COALESCE(SyncTimestamp, Timestamp)) from {CheckpointsTable};"))
                         {
                             oldestCheckpointTimestamp = statement.SelectScalarInt64();
                         }

@@ -101,6 +101,23 @@ public sealed class HousekeepingTests : IDisposable
         Assert.Equal(1, SnapshotItemCount(activeCheckpoint));
     }
 
+    [Fact]
+    public void DeleteOldData_UsesCompletedSnapshotCutoffForLiveRetention()
+    {
+        var activeCheckpoint = InsertCheckpoint(50, 200, 200);
+        InsertCheckpointItem(activeCheckpoint, 75);
+        _database.SaveItems(new[] { Item(50), Item(199), Item(200), Item(250) });
+        _database.SaveUserInfo(
+            new List<UserInfoRec> { UserInfo(50), UserInfo(199), UserInfo(200), UserInfo(250) });
+
+        _database.DeleteOldData(100);
+
+        Assert.NotNull(_database.GetCheckpoint(activeCheckpoint));
+        Assert.Equal(1, SnapshotItemCount(activeCheckpoint));
+        Assert.Equal(new long[] { 200, 250 }, ReadTimestamps("items"));
+        Assert.Equal(new long[] { 200, 250 }, ReadTimestamps("user_info"));
+    }
+
     public void Dispose()
     {
         _database.Dispose();
@@ -108,19 +125,23 @@ public sealed class HousekeepingTests : IDisposable
         Directory.Delete(_databaseDirectory, true);
     }
 
-    private Guid InsertCheckpoint(long timestamp, long? lastActivity = null)
+    private Guid InsertCheckpoint(
+        long timestamp,
+        long? lastActivity = null,
+        long? syncTimestamp = null)
     {
         var checkpointId = Guid.NewGuid();
         using var connection = new SqliteConnection($"Data Source={_databasePath}");
         connection.Open();
         using var command = connection.CreateCommand();
         command.CommandText =
-            "insert into checkpoints(Guid, DeviceId, UserId, Timestamp, LastActivity) " +
-            "values (@Guid, @DeviceId, @UserId, @Timestamp, @LastActivity);";
+            "insert into checkpoints(Guid, DeviceId, UserId, Timestamp, SyncTimestamp, LastActivity) " +
+            "values (@Guid, @DeviceId, @UserId, @Timestamp, @SyncTimestamp, @LastActivity);";
         command.Parameters.Add("@Guid", SqliteType.Blob).Value = checkpointId.ToByteArray();
         command.Parameters.AddWithValue("@DeviceId", Guid.NewGuid().ToString("N"));
         command.Parameters.AddWithValue("@UserId", "user-1");
         command.Parameters.AddWithValue("@Timestamp", timestamp);
+        command.Parameters.AddWithValue("@SyncTimestamp", (object)syncTimestamp ?? DBNull.Value);
         command.Parameters.AddWithValue("@LastActivity", lastActivity ?? timestamp);
         command.ExecuteNonQuery();
         return checkpointId;
