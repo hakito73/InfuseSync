@@ -26,8 +26,8 @@ public sealed class SnapshotSourceIndexTests : IDisposable
             Execute(
                 connection,
                 """
-                PRAGMA user_version = 3;
-                create table checkpoints (Guid BLOB PRIMARY KEY, DeviceId TEXT NOT NULL, UserId TEXT NOT NULL, Timestamp INTEGER NOT NULL, SyncTimestamp INTEGER NULL);
+                PRAGMA user_version = 4;
+                create table checkpoints (Guid BLOB PRIMARY KEY, DeviceId TEXT NOT NULL, UserId TEXT NOT NULL, Timestamp INTEGER NOT NULL, SyncTimestamp INTEGER NULL, LastActivity INTEGER NOT NULL);
                 create table items (Guid BLOB PRIMARY KEY, SeriesId BLOB NULL, Season INTEGER NULL, Status INTEGER NOT NULL, LastModified INTEGER NOT NULL, Type TEXT NOT NULL);
                 create table user_info (Guid BLOB NOT NULL, UserId TEXT NOT NULL, LastModified INTEGER NOT NULL, Type TEXT NOT NULL, PRIMARY KEY (Guid, UserId));
                 create index idx_items on items(Guid);
@@ -42,7 +42,7 @@ public sealed class SnapshotSourceIndexTests : IDisposable
         }
 
         using var initialized = Open(databasePath);
-        Assert.Equal(3L, Scalar<long>(initialized, "PRAGMA user_version;"));
+        Assert.Equal(4L, Scalar<long>(initialized, "PRAGMA user_version;"));
         Assert.Equal(1L, Scalar<long>(initialized, "select COUNT(*) from items;"));
         Assert.Equal(1L, Scalar<long>(initialized, "select COUNT(*) from user_info;"));
         Assert.True(IndexExists(initialized, ItemsIndex));
