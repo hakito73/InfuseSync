@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
@@ -13,7 +14,6 @@ using InfuseSync.Models;
 using InfuseSync.Logging;
 using ILogger = MediaBrowser.Model.Logging.ILogger;
 #else
-using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ILogger = Microsoft.Extensions.Logging.ILogger<InfuseSync.EntryPoints.LibrarySyncManager>;
@@ -31,11 +31,14 @@ namespace InfuseSync.EntryPoints
         private readonly ILogger _logger;
         private readonly CoalescingBatchWriter<string, ItemRec> _pendingItems;
         private readonly EventHandlerTracker _eventHandlers = new EventHandlerTracker();
+        private Task<BatchStopResult> _deferredStop;
 
         private static readonly TimeSpan WriteDelay = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan MaximumWriteDelay = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(5);
+
+        internal Task<BatchStopResult> DeferredStop => _deferredStop;
 
         public LibrarySyncManager(ILibraryManager libraryManager, ILogger logger)
         {
@@ -49,7 +52,7 @@ namespace InfuseSync.EntryPoints
                 SaveItems,
                 (exception, count) => _logger.LogError(
                     exception,
-                    $"Unable to save {count} pending library changes. A retry has been scheduled."));
+                    $"Unable to save {count} pending library changes. Changes remain queued."));
         }
 
         public void Run()
@@ -275,10 +278,13 @@ namespace InfuseSync.EntryPoints
             var handlerError = _eventHandlers.StopAndWait(ShutdownTimeout, cancellationToken);
             if (handlerError != null)
             {
+                _deferredStop = _eventHandlers.ContinueWhenIdle(
+                    () => FlushPending(ShutdownTimeout, CancellationToken.None, true));
                 _logger.LogError(
                     handlerError,
                     $"Library sync shutdown stopped with {_eventHandlers.ActiveCount} active handlers and " +
-                    $"{_pendingItems.OutstandingCount} queued changes not confirmed persisted.");
+                    $"{_pendingItems.OutstandingCount} queued changes not confirmed persisted. " +
+                    "A deferred drain has been scheduled.");
                 return;
             }
 
@@ -288,14 +294,29 @@ namespace InfuseSync.EntryPoints
                 remaining = TimeSpan.Zero;
             }
 
-            var result = _pendingItems.StopAndFlush(remaining, cancellationToken);
+            FlushPending(remaining, cancellationToken, false);
+        }
+
+        private BatchStopResult FlushPending(
+            TimeSpan timeout,
+            CancellationToken cancellationToken,
+            bool deferred)
+        {
+            var result = _pendingItems.StopAndFlush(timeout, cancellationToken);
             if (!result.Succeeded)
             {
                 _logger.LogError(
                     result.Error,
                     $"Unable to confirm {result.UnsavedCount} library changes persisted during shutdown " +
-                    $"after {result.Attempts} attempts.");
+                    $"after {result.Attempts} batch write attempts.");
             }
+            else if (deferred)
+            {
+                _logger.LogDebug(
+                    $"Deferred library sync drain completed after {result.Attempts} batch write attempts.");
+            }
+
+            return result;
         }
 
 #if EMBY

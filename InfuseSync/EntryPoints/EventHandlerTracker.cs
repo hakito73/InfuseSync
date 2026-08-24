@@ -1,12 +1,14 @@
 using System;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace InfuseSync.EntryPoints
 {
     internal sealed class EventHandlerTracker
     {
         private readonly object _syncLock = new object();
-        private readonly ManualResetEventSlim _idle = new ManualResetEventSlim(true);
+        private Task _idle = Task.CompletedTask;
+        private TaskCompletionSource<bool> _idleSource;
         private int _activeHandlers;
         private bool _isStopping;
 
@@ -23,7 +25,9 @@ namespace InfuseSync.EntryPoints
 
                 if (_activeHandlers++ == 0)
                 {
-                    _idle.Reset();
+                    _idleSource = new TaskCompletionSource<bool>(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    _idle = _idleSource.Task;
                 }
 
                 return true;
@@ -32,24 +36,37 @@ namespace InfuseSync.EntryPoints
 
         public void Exit()
         {
+            TaskCompletionSource<bool> idleSource = null;
             lock (_syncLock)
             {
                 _activeHandlers--;
-                if (_activeHandlers == 0) _idle.Set();
+                if (_activeHandlers == 0)
+                {
+                    idleSource = _idleSource;
+                    _idleSource = null;
+                }
             }
+
+            idleSource?.SetResult(true);
         }
 
         public Exception StopAndWait(TimeSpan timeout, CancellationToken cancellationToken)
         {
+            Task idle;
             lock (_syncLock)
             {
                 _isStopping = true;
-                if (_activeHandlers == 0) return null;
+                idle = _idle;
             }
+
+            if (idle.IsCompleted) return null;
 
             try
             {
-                return _idle.Wait(timeout, cancellationToken)
+                var waitMilliseconds = (int)Math.Min(
+                    Math.Ceiling(timeout.TotalMilliseconds),
+                    int.MaxValue);
+                return idle.Wait(waitMilliseconds, cancellationToken)
                     ? null
                     : new TimeoutException("Timed out while waiting for event handlers.");
             }
@@ -57,6 +74,23 @@ namespace InfuseSync.EntryPoints
             {
                 return exception;
             }
+        }
+
+        public Task<T> ContinueWhenIdle<T>(Func<T> continuation)
+        {
+            if (continuation == null) throw new ArgumentNullException(nameof(continuation));
+
+            Task idle;
+            lock (_syncLock)
+            {
+                idle = _idle;
+            }
+
+            return idle.ContinueWith(
+                _ => continuation(),
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default);
         }
     }
 }
