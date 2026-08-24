@@ -564,8 +564,29 @@ namespace InfuseSync.Storage
 
         public void SaveItems(IEnumerable<ItemRec> items)
         {
+            SaveItems(items, false);
+        }
+
+        public void SaveItemsNow(IEnumerable<ItemRec> items)
+        {
+            SaveItems(items, true);
+        }
+
+        private void SaveItems(IEnumerable<ItemRec> items, bool setLastModified)
+        {
             using (WriteLock.Write())
             {
+                var itemsToSave = items.ToList();
+                if (setLastModified)
+                {
+                    // Checkpoint cursors use the same lock, so timestamp assignment must happen here.
+                    var timestamp = DateTime.UtcNow.ToFileTime();
+                    foreach (var item in itemsToSave)
+                    {
+                        item.LastModified = timestamp;
+                    }
+                }
+
                 using (var connection = CreateConnection())
                 {
                     connection.RunInTransaction(db =>
@@ -575,7 +596,7 @@ namespace InfuseSync.Storage
 #else
                         var sql = $"insert or replace into {ItemsTable} values (@Guid, @SeriesId, @Season, @Status, @LastModified, @Type);";
 #endif
-                        foreach (var i in items)
+                        foreach (var i in itemsToSave)
                         {
                             using (var statement = db.PrepareStatement(sql))
                             {
@@ -598,8 +619,29 @@ namespace InfuseSync.Storage
 
         public void SaveUserInfo(List<UserInfoRec> infoRecs)
         {
+            SaveUserInfo(infoRecs, false);
+        }
+
+        public void SaveUserInfoNow(IEnumerable<UserInfoRec> infoRecs)
+        {
+            SaveUserInfo(infoRecs, true);
+        }
+
+        private void SaveUserInfo(IEnumerable<UserInfoRec> infoRecs, bool setLastModified)
+        {
             using (WriteLock.Write())
             {
+                var infoRecsToSave = infoRecs.ToList();
+                if (setLastModified)
+                {
+                    // Checkpoint cursors use the same lock, so timestamp assignment must happen here.
+                    var timestamp = DateTime.UtcNow.ToFileTime();
+                    foreach (var infoRec in infoRecsToSave)
+                    {
+                        infoRec.LastModified = timestamp;
+                    }
+                }
+
                 using (var connection = CreateConnection())
                 {
                     connection.RunInTransaction(db =>
@@ -609,7 +651,7 @@ namespace InfuseSync.Storage
 #else
                         var sql = $"insert or replace into {UserInfoTable} values (@Guid, @UserId, @LastModified, @Type);";
 #endif
-                        foreach (var i in infoRecs)
+                        foreach (var i in infoRecsToSave)
                         {
                             using (var statement = db.PrepareStatement(sql))
                             {
