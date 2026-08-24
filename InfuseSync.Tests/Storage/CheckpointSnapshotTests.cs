@@ -69,6 +69,20 @@ public sealed class CheckpointSnapshotTests : IDisposable
     }
 
     [Fact]
+    public void StartSync_RetryRefreshesCheckpointActivity()
+    {
+        var checkpoint = _database.CreateCheckpoint("living-room", "user-1");
+        var firstStart = _database.StartSync(checkpoint.Guid, checkpoint.Timestamp + 10);
+        SetLastActivity(checkpoint.Guid, 50);
+
+        var retry = _database.StartSync(checkpoint.Guid, checkpoint.Timestamp + 20);
+
+        Assert.Equal(firstStart.SyncTimestamp, retry.SyncTimestamp);
+        Assert.True(retry.LastActivity > 50);
+        Assert.Equal(retry.LastActivity, _database.GetCheckpoint(checkpoint.Guid).LastActivity);
+    }
+
+    [Fact]
     public void Snapshot_KeepsUserDataScopedToCheckpointUser()
     {
         var checkpoint = _database.CreateCheckpoint("living-room", "user-1");
@@ -136,6 +150,42 @@ public sealed class CheckpointSnapshotTests : IDisposable
             item => Assert.Equal(itemId, item.Guid));
     }
 
+    [Fact]
+    public void VersionThreeDatabase_AddsActivityWithoutLosingCheckpointOrSnapshot()
+    {
+        var checkpoint = _database.CreateCheckpoint("living-room", "user-1");
+        var itemId = Guid.NewGuid();
+        _database.SaveItems(new[] { Item(itemId, checkpoint.Timestamp + 1) });
+        _database.StartSync(checkpoint.Guid, checkpoint.Timestamp + 10);
+        _database.Dispose();
+
+        SqliteConnection.ClearAllPools();
+        using (var connection = new SqliteConnection($"Filename={DatabasePath}"))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                "alter table checkpoints rename to checkpoints_v4; " +
+                "create table checkpoints (Guid GUID PRIMARY KEY, DeviceId TEXT NOT NULL, UserId TEXT NOT NULL, Timestamp INTEGER NOT NULL, SyncTimestamp INTEGER NULL); " +
+                "insert into checkpoints(Guid, DeviceId, UserId, Timestamp, SyncTimestamp) select Guid, DeviceId, UserId, Timestamp, SyncTimestamp from checkpoints_v4; " +
+                "drop table checkpoints_v4; " +
+                "PRAGMA user_version = 3;";
+            command.ExecuteNonQuery();
+        }
+
+        var migrationStarted = DateTime.UtcNow.AddSeconds(-1).ToFileTime();
+        using var migrated = new Db(_databaseDirectory, NullLogger.Instance);
+        var migratedCheckpoint = migrated.GetCheckpoint(checkpoint.Guid);
+
+        Assert.NotNull(migratedCheckpoint);
+        Assert.True(migratedCheckpoint.LastActivity >= migrationStarted);
+        Assert.Equal(checkpoint.Timestamp + 10, migratedCheckpoint.SyncTimestamp);
+        Assert.Collection(
+            migrated.GetItems(checkpoint.Guid, ItemStatus.Updated, null, 0, 10),
+            item => Assert.Equal(itemId, item.Guid));
+        Assert.Equal(4, ReadUserVersion());
+    }
+
     public void Dispose()
     {
         _database.Dispose();
@@ -144,6 +194,26 @@ public sealed class CheckpointSnapshotTests : IDisposable
     }
 
     private string DatabasePath => Path.Combine(_databaseDirectory, "infuse_sync.db");
+
+    private void SetLastActivity(Guid checkpointId, long lastActivity)
+    {
+        using var connection = new SqliteConnection($"Filename={DatabasePath}");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "update checkpoints set LastActivity=@LastActivity where Guid=@Guid;";
+        command.Parameters.AddWithValue("@LastActivity", lastActivity);
+        command.Parameters.Add("@Guid", SqliteType.Blob).Value = checkpointId.ToByteArray();
+        command.ExecuteNonQuery();
+    }
+
+    private int ReadUserVersion()
+    {
+        using var connection = new SqliteConnection($"Filename={DatabasePath}");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA user_version;";
+        return Convert.ToInt32(command.ExecuteScalar());
+    }
 
     private static ItemRec Item(Guid guid, long timestamp)
         => new()
