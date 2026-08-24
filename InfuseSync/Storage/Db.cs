@@ -501,27 +501,22 @@ namespace InfuseSync.Storage
                             }
                         }
 
-                        bool hasSessions;
-                        using (var statement = connection.PrepareStatement($"select exists(select 1 from {CheckpointsTable});"))
+                        long? oldestCheckpointTimestamp;
+                        using (var statement = db.PrepareStatement($"select MIN(Timestamp) from {CheckpointsTable};"))
                         {
-                            hasSessions = statement.SelectScalarInt() == 1;
+                            oldestCheckpointTimestamp = statement.SelectScalarInt64();
                         }
 
-                        if (hasSessions)
+                        if (oldestCheckpointTimestamp.HasValue)
                         {
-                            long minTimestamp;
-                            using (var statement = connection.PrepareStatement($"select MIN(Timestamp) from {CheckpointsTable};"))
-                            {
-                                minTimestamp = statement.SelectScalarInt64() ?? 0;
-                            }
                             using (var statement = db.PrepareStatement($"delete from {ItemsTable} where LastModified < @Timestamp;"))
                             {
-                                statement.TryBind("@Timestamp", timestamp);
+                                statement.TryBind("@Timestamp", oldestCheckpointTimestamp.Value);
                                 statement.ExecuteNonQuery();
                             }
                             using (var statement = db.PrepareStatement($"delete from {UserInfoTable} where LastModified < @Timestamp;"))
                             {
-                                statement.TryBind("@Timestamp", timestamp);
+                                statement.TryBind("@Timestamp", oldestCheckpointTimestamp.Value);
                                 statement.ExecuteNonQuery();
                             }
                         }
