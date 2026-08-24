@@ -91,6 +91,50 @@ public sealed class DbTests : IDisposable
         Assert.Equal(1, _database.UserInfoCount(90, 110, "user-2", null));
     }
 
+    [Fact]
+    public void GetItems_OrdersPagesByTimestampAndGuid()
+    {
+        var firstId = Guid.Parse("00000000-0000-0000-0000-000000000001");
+        var secondId = Guid.Parse("00000000-0000-0000-0000-000000000002");
+        var thirdId = Guid.Parse("00000000-0000-0000-0000-000000000003");
+
+        _database.SaveItems(
+            new[]
+            {
+                Item(thirdId, "Movie", ItemStatus.Updated, 101),
+                Item(secondId, "Movie", ItemStatus.Updated, 100),
+                Item(firstId, "Movie", ItemStatus.Updated, 100)
+            });
+
+        var firstPage = _database.GetItems(90, 110, ItemStatus.Updated, null, 0, 2);
+        var secondPage = _database.GetItems(90, 110, ItemStatus.Updated, null, 2, 2);
+
+        Assert.Equal(new[] { firstId, secondId }, firstPage.Select(item => item.Guid));
+        Assert.Collection(secondPage, item => Assert.Equal(thirdId, item.Guid));
+    }
+
+    [Fact]
+    public void GetUserInfos_OrdersPagesByTimestampAndGuid()
+    {
+        var firstId = Guid.Parse("00000000-0000-0000-0000-000000000001");
+        var secondId = Guid.Parse("00000000-0000-0000-0000-000000000002");
+        var thirdId = Guid.Parse("00000000-0000-0000-0000-000000000003");
+
+        _database.SaveUserInfo(
+            new List<UserInfoRec>
+            {
+                UserInfo(thirdId, "user-1", 101),
+                UserInfo(secondId, "user-1", 100),
+                UserInfo(firstId, "user-1", 100)
+            });
+
+        var firstPage = _database.GetUserInfos(90, 110, "user-1", null, 0, 2);
+        var secondPage = _database.GetUserInfos(90, 110, "user-1", null, 2, 2);
+
+        Assert.Equal(new[] { firstId, secondId }, firstPage.Select(item => item.Guid));
+        Assert.Collection(secondPage, item => Assert.Equal(thirdId, item.Guid));
+    }
+
     public void Dispose()
     {
         _database.Dispose();
