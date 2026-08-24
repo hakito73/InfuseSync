@@ -17,7 +17,7 @@ namespace InfuseSync.Storage.Migrations
 {
     public class DbVersionManager: IDisposable
     {
-        private const int DbVersion = 3;
+        private const int DbVersion = 4;
 
         public readonly Dictionary<int, IDbMigration> migrations;
 
@@ -30,7 +30,8 @@ namespace InfuseSync.Storage.Migrations
             migrations = new IDbMigration[] {
                 new MigrationDropBetaDatabase(),
                 new MigrationChangeUserDataPrimaryKey(),
-                new MigrationAddCheckpointSnapshots()
+                new MigrationAddCheckpointSnapshots(),
+                new MigrationAddCheckpointActivity()
             }
             .ToDictionary(m => m.DbVersion, m => m);
         }
