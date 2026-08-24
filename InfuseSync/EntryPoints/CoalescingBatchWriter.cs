@@ -110,6 +110,7 @@ namespace InfuseSync.EntryPoints
                 throw new ArgumentOutOfRangeException(nameof(timeout));
             }
 
+            bool activeWriteAtStart;
             lock (_syncLock)
             {
                 if (_stopResult != null)
@@ -127,11 +128,13 @@ namespace InfuseSync.EntryPoints
 
                 _isStopping = true;
                 CancelTimer();
+                activeWriteAtStart = _activeWrite != null;
             }
 
             var elapsed = Stopwatch.StartNew();
             Exception lastError = null;
-            var attempts = 0;
+            var attempts = activeWriteAtStart ? 1 : 0;
+            var shutdownAttempts = 0;
 
             while (true)
             {
@@ -160,7 +163,7 @@ namespace InfuseSync.EntryPoints
                     return CompleteStop(null, attempts);
                 }
 
-                if (attempts == ShutdownWriteAttempts)
+                if (shutdownAttempts == ShutdownWriteAttempts)
                 {
                     return CompleteStop(lastError, attempts);
                 }
@@ -178,6 +181,7 @@ namespace InfuseSync.EntryPoints
                 if (StartWrite(true) != null)
                 {
                     attempts++;
+                    shutdownAttempts++;
                 }
             }
         }

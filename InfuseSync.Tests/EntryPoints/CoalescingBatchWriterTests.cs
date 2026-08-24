@@ -112,12 +112,19 @@ public sealed class CoalescingBatchWriterTests
     }
 
     [Fact]
-    public void StopReportsItemsLeftAfterBoundedRetries()
+    public async Task StopReportsActiveWriteAndBoundedRetriesExactly()
     {
+        using var writeStarted = new ManualResetEventSlim();
+        using var allowWrite = new ManualResetEventSlim();
         var attempts = 0;
         var writer = CreateWriter(_ =>
         {
-            Interlocked.Increment(ref attempts);
+            if (Interlocked.Increment(ref attempts) == 1)
+            {
+                writeStarted.Set();
+                allowWrite.Wait(TimeSpan.FromSeconds(5));
+            }
+
             throw new InvalidOperationException("database unavailable");
         });
         var first = Guid.NewGuid();
@@ -125,13 +132,22 @@ public sealed class CoalescingBatchWriterTests
         writer.Enqueue(first, Item(first, ItemStatus.Updated));
         writer.Enqueue(second, Item(second, ItemStatus.Removed));
 
+        var activeFlush = Task.Run(() => writer.FlushNow());
+        Assert.True(writeStarted.Wait(TimeSpan.FromSeconds(5)));
+        var releaseWrite = Task.Run(async () =>
+        {
+            await Task.Delay(100);
+            allowWrite.Set();
+        });
         var result = Stop(writer);
 
+        await releaseWrite;
+        Assert.False(await activeFlush);
         Assert.False(result.Succeeded);
         Assert.IsType<InvalidOperationException>(result.Error);
-        Assert.Equal(3, result.Attempts);
+        Assert.Equal(4, result.Attempts);
         Assert.Equal(2, result.UnsavedCount);
-        Assert.Equal(3, attempts);
+        Assert.Equal(4, attempts);
         Assert.Equal(2, writer.PendingCount);
         var third = Guid.NewGuid();
         Assert.False(writer.Enqueue(third, Item(third, ItemStatus.Updated)));
@@ -161,14 +177,43 @@ public sealed class CoalescingBatchWriterTests
         var activeFlush = Task.Run(() => writer.FlushNow());
         Assert.True(writeStarted.Wait(TimeSpan.FromSeconds(5)));
         writer.Enqueue(second, Item(second, ItemStatus.Removed));
-        var stop = Task.Run(() => Stop(writer));
-        allowWrite.Set();
+        var releaseWrite = Task.Run(async () =>
+        {
+            await Task.Delay(100);
+            allowWrite.Set();
+        });
+        var result = Stop(writer);
 
+        await releaseWrite;
         Assert.True(await activeFlush);
-        var result = await stop;
+        Assert.True(result.Succeeded);
+        Assert.Equal(2, result.Attempts);
+        Assert.Equal(2, writes.Count);
+    }
+
+    [Fact]
+    public async Task AcceptedHandlerIsFlushedByDeferredDrain()
+    {
+        var writes = new List<IReadOnlyCollection<ItemRec>>();
+        var writer = CreateWriter(batch => writes.Add(batch));
+        var handlers = new EventHandlerTracker();
+        Assert.True(handlers.TryEnter());
+
+        var error = handlers.StopAndWait(TimeSpan.Zero, CancellationToken.None);
+        var deferred = handlers.ContinueWhenIdle(() => Stop(writer));
+        var key = Guid.NewGuid();
+        writer.Enqueue(key, Item(key, ItemStatus.Updated));
+
+        Assert.IsType<TimeoutException>(error);
+        Assert.False(deferred.IsCompleted);
+        Assert.False(handlers.TryEnter());
+
+        handlers.Exit();
+        var result = await deferred;
+
         Assert.True(result.Succeeded);
         Assert.Equal(1, result.Attempts);
-        Assert.Equal(2, writes.Count);
+        Assert.Equal(ItemStatus.Updated, Assert.Single(Assert.Single(writes)).Status);
     }
 
     [Theory]
