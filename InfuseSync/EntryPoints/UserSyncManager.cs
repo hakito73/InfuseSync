@@ -1,9 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
-using System.Linq;
 using System.Threading;
-using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Plugins;
@@ -31,18 +30,28 @@ namespace InfuseSync.EntryPoints
         private readonly ILogger _logger;
         private readonly IUserDataManager _userDataManager;
         private readonly IUserManager _userManager;
+        private readonly CoalescingBatchWriter<string, UserInfoRec> _pendingUserInfo;
+        private readonly EventHandlerTracker _eventHandlers = new EventHandlerTracker();
 
-        private readonly object _syncLock = new object();
-        private Timer UpdateTimer { get; set; }
-        private const int UpdateDuration = 500;
-
-        private readonly Dictionary<Guid, List<BaseItem>> _changedItems = new Dictionary<Guid, List<BaseItem>>();
+        private static readonly TimeSpan UpdateDelay = TimeSpan.FromMilliseconds(500);
+        private static readonly TimeSpan MaximumUpdateDelay = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(5);
 
         public UserSyncManager(IUserDataManager userDataManager, ILogger logger, IUserManager userManager)
         {
             _userDataManager = userDataManager;
             _logger = logger;
             _userManager = userManager;
+            _pendingUserInfo = new CoalescingBatchWriter<string, UserInfoRec>(
+                UpdateDelay,
+                MaximumUpdateDelay,
+                RetryDelay,
+                (current, incoming) => current,
+                SaveUserInfo,
+                (exception, count) => _logger.LogError(
+                    exception,
+                    $"Unable to save {count} pending user data changes. A retry has been scheduled."));
         }
 
         public void Run()
@@ -61,7 +70,24 @@ namespace InfuseSync.EntryPoints
 
         void UserDataSaved(object sender, UserDataSaveEventArgs e)
         {
-            if (e.SaveReason == UserDataSaveReason.PlaybackProgress)
+            if (!_eventHandlers.TryEnter())
+            {
+                return;
+            }
+
+            try
+            {
+                HandleUserDataSaved(e);
+            }
+            finally
+            {
+                _eventHandlers.Exit();
+            }
+        }
+
+        private void HandleUserDataSaved(UserDataSaveEventArgs e)
+        {
+            if (e.SaveReason == UserDataSaveReason.PlaybackProgress || e.Item == null)
             {
                 return;
             }
@@ -72,112 +98,94 @@ namespace InfuseSync.EntryPoints
 #endif
             _logger.LogDebug(message);
 
-            lock (_syncLock)
+            if (!Shared.ShouldSyncUpdatedItem(e.Item))
             {
-                if (e.Item != null)
-                {
-                    if (!Shared.ShouldSyncUpdatedItem(e.Item))
-                    {
-                        return;
-                    }
+                return;
+            }
 
-                    if (UpdateTimer == null)
-                    {
-                        UpdateTimer = new Timer(
-                            TimerCallback,
-                            null,
-                            UpdateDuration,
-                            Timeout.Infinite
-                        );
-                    }
-                    else
-                    {
-                        UpdateTimer.Change(UpdateDuration, Timeout.Infinite);
-                    }
 #if EMBY
-                    var userId = e.User.Id;
+            var userId = e.User.Id;
 #else
-                    var userId = e.UserId;
+            var userId = e.UserId;
 #endif
-                    if (!_changedItems.TryGetValue(userId, out var keys))
-                    {
-                        keys = new List<BaseItem>();
-                        _changedItems[userId] = keys;
-                    }
-
-                    keys.Add(e.Item);
-
-                    _logger.LogDebug($"InfuseSync will save user data for item {e.Item.Id} user {userId}");
-                }
-            }
-        }
-
-        private void TimerCallback(object state)
-        {
-            lock (_syncLock)
-            try
+            var infoRec = new UserInfoRec
             {
-                var changes = _changedItems.ToList();
-                _changedItems.Clear();
-
-                SendNotifications(changes);
-
-                if (UpdateTimer != null)
-                {
-                    UpdateTimer.Dispose();
-                    UpdateTimer = null;
-                }
-            }
-            catch (Exception e)
-            {
-                _logger.LogError(e, $"An Error Has Occurred in TimerCallback: {e}");
-            }
-        }
-
-        private void SendNotifications(IEnumerable<KeyValuePair<Guid, List<BaseItem>>> changes)
-        {
-            var options = new DtoOptions();
-            var infoRecs = changes
-                .SelectMany(change => change.Value
-                    .GroupBy(i => i.Id)
-                    .Select(i => i.First())
-                    .Select(i => {
-                        return new UserInfoRec {
-                            Guid = i.Id,
+                Guid = e.Item.Id,
 #if EMBY
-                            ItemId = i.GetClientId(),
+                ItemId = e.Item.GetClientId(),
 #endif
-                            UserId = change.Key.ToString("N", CultureInfo.InvariantCulture),
-                            LastModified = DateTime.UtcNow.ToFileTime(),
-                            Type = i.GetClientTypeName()
-                        };
-                    })
-                ).ToList();
+                UserId = userId.ToString("N", CultureInfo.InvariantCulture),
+                Type = e.Item.GetClientTypeName()
+            };
 
-            Plugin.Instance.Db.SaveUserInfo(infoRecs);
+            if (_pendingUserInfo.Enqueue(GetUserItemKey(userId, infoRec), infoRec))
+            {
+                _logger.LogDebug($"InfuseSync will save user data for item {e.Item.Id} user {userId}");
+            }
+        }
+
+        private static string GetUserItemKey(Guid userId, UserInfoRec infoRec)
+        {
+#if EMBY
+            return $"{userId:N}:{infoRec.ItemId}";
+#else
+            return $"{userId:N}:{infoRec.Guid:N}";
+#endif
+        }
+
+        private void SaveUserInfo(IReadOnlyCollection<UserInfoRec> infoRecs)
+        {
+            Plugin.Instance.Db.SaveUserInfoNow(infoRecs);
         }
 
         private bool _disposed;
 
         protected virtual void Dispose(bool disposing)
         {
+            if (!disposing)
+            {
+                _disposed = true;
+                return;
+            }
+
+            Stop(CancellationToken.None);
+        }
+
+        private void Stop(CancellationToken cancellationToken)
+        {
             if (_disposed)
             {
                 return;
             }
 
-            if (disposing)
-            {
-                if (UpdateTimer != null)
-                {
-                    UpdateTimer.Dispose();
-                    UpdateTimer = null;
-                }
+            _disposed = true;
+            _userDataManager.UserDataSaved -= UserDataSaved;
 
-                _userDataManager.UserDataSaved -= UserDataSaved;
+            var elapsed = Stopwatch.StartNew();
+            var handlerError = _eventHandlers.StopAndWait(ShutdownTimeout, cancellationToken);
+            if (handlerError != null)
+            {
+                _logger.LogError(
+                    handlerError,
+                    $"User sync shutdown stopped with {_eventHandlers.ActiveCount} active handlers and " +
+                    $"{_pendingUserInfo.OutstandingCount} queued changes not confirmed persisted.");
+                return;
             }
 
-            _disposed = true;
+            var remaining = ShutdownTimeout - elapsed.Elapsed;
+            if (remaining < TimeSpan.Zero)
+            {
+                remaining = TimeSpan.Zero;
+            }
+
+            var result = _pendingUserInfo.StopAndFlush(remaining, cancellationToken);
+            if (!result.Succeeded)
+            {
+                _logger.LogError(
+                    result.Error,
+                    $"Unable to confirm {result.UnsavedCount} user data changes persisted during shutdown " +
+                    $"after {result.Attempts} attempts.");
+            }
         }
 
 #if EMBY
@@ -189,7 +197,7 @@ namespace InfuseSync.EntryPoints
 #else
         public Task StopAsync(CancellationToken cancellationToken)
         {
-            Dispose(true);
+            Stop(cancellationToken);
 
             return Task.CompletedTask;
         }
