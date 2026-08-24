@@ -81,6 +81,13 @@ namespace InfuseSync.EntryPoints
 
         private void ItemUpdated(BaseItem item)
         {
+#if JELLYFIN
+            item = Shared.ResolveUpdatedItem(
+                item,
+                id => _libraryManager.GetItemById(id),
+                (primary, versionId) => primary.GetLocalAlternateVersionIds().Contains(versionId));
+#endif
+
             lock (_libraryChangedSyncLock)
             {
                 if (WriteTimer == null)

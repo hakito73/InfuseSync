@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using MediaBrowser.Controller.Channels;
 using MediaBrowser.Controller.Entities;
@@ -29,6 +30,45 @@ namespace InfuseSync.EntryPoints
         {
             return ShouldSyncItem(item, t => SyncTypes.Contains(t));
         }
+
+#if JELLYFIN
+        public static BaseItem ResolveUpdatedItem(
+            BaseItem item,
+            Func<Guid, BaseItem> itemResolver,
+            Func<Video, Guid, bool> isLocalVersion)
+        {
+            if (item is not Video video)
+            {
+                return item;
+            }
+
+            var candidateIds = new List<Guid>();
+            if (Guid.TryParse(video.PrimaryVersionId, out var primaryVersionId))
+            {
+                candidateIds.Add(primaryVersionId);
+            }
+
+            if (video.OwnerId != Guid.Empty && !candidateIds.Contains(video.OwnerId))
+            {
+                candidateIds.Add(video.OwnerId);
+            }
+
+            foreach (var candidateId in candidateIds)
+            {
+                if (candidateId == video.Id || itemResolver(candidateId) is not Video primary)
+                {
+                    continue;
+                }
+
+                if (isLocalVersion(primary, video.Id))
+                {
+                    return primary;
+                }
+            }
+
+            return item;
+        }
+#endif
 
         private static bool ShouldSyncItem(BaseItem item, Func<string, bool> typeCheck)
         {
