@@ -47,6 +47,7 @@
     <Compile Include="Storage/Migrations/DbVersionManager.cs" />
     <Compile Include="Storage/Migrations/IDbMigration.cs" />
     <Compile Include="Storage/Migrations/MigrationAddCheckpointSnapshots.cs" />
+    <Compile Include="Storage/Migrations/MigrationAddCheckpointActivity.cs" />
     <Compile Include="Storage/Migrations/MigrationChangeUserDataPrimaryKey.cs" />
     <Compile Include="Storage/Migrations/MigrationDropBetaDatabase.cs" />
   </ItemGroup>

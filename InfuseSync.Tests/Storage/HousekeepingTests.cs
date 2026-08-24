@@ -89,6 +89,18 @@ public sealed class HousekeepingTests : IDisposable
         Assert.Equal(1, SnapshotItemCount(activeCheckpoint));
     }
 
+    [Fact]
+    public void DeleteOldData_KeepsRecentlyActiveCheckpointWithOldCursor()
+    {
+        var activeCheckpoint = InsertCheckpoint(50, 200);
+        InsertCheckpointItem(activeCheckpoint, 75);
+
+        _database.DeleteOldData(100);
+
+        Assert.NotNull(_database.GetCheckpoint(activeCheckpoint));
+        Assert.Equal(1, SnapshotItemCount(activeCheckpoint));
+    }
+
     public void Dispose()
     {
         _database.Dispose();
@@ -96,18 +108,20 @@ public sealed class HousekeepingTests : IDisposable
         Directory.Delete(_databaseDirectory, true);
     }
 
-    private Guid InsertCheckpoint(long timestamp)
+    private Guid InsertCheckpoint(long timestamp, long? lastActivity = null)
     {
         var checkpointId = Guid.NewGuid();
         using var connection = new SqliteConnection($"Data Source={_databasePath}");
         connection.Open();
         using var command = connection.CreateCommand();
         command.CommandText =
-            "insert into checkpoints(Guid, DeviceId, UserId, Timestamp) values (@Guid, @DeviceId, @UserId, @Timestamp);";
+            "insert into checkpoints(Guid, DeviceId, UserId, Timestamp, LastActivity) " +
+            "values (@Guid, @DeviceId, @UserId, @Timestamp, @LastActivity);";
         command.Parameters.Add("@Guid", SqliteType.Blob).Value = checkpointId.ToByteArray();
         command.Parameters.AddWithValue("@DeviceId", Guid.NewGuid().ToString("N"));
         command.Parameters.AddWithValue("@UserId", "user-1");
         command.Parameters.AddWithValue("@Timestamp", timestamp);
+        command.Parameters.AddWithValue("@LastActivity", lastActivity ?? timestamp);
         command.ExecuteNonQuery();
         return checkpointId;
     }
