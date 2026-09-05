@@ -196,6 +196,7 @@ namespace InfuseSync.Storage
                             return checkpoint;
                         }
 
+                        // Keep the same rows if the client retries or asks for another page.
                         CreateSnapshot(db, checkpoint, syncTimestamp);
 
                         using (var statement = db.PrepareStatement($"update {CheckpointsTable} set SyncTimestamp=@SyncTimestamp where Guid=@Guid;"))
