@@ -523,6 +523,7 @@ namespace InfuseSync.Storage
                             }
                         }
 
+                        // Started syncs already have their older changes in a snapshot.
                         long? oldestCheckpointTimestamp;
                         using (var statement = db.PrepareStatement($"select MIN(COALESCE(SyncTimestamp, Timestamp)) from {CheckpointsTable};"))
                         {

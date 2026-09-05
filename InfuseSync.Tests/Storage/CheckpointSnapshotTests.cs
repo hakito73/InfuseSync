@@ -37,8 +37,7 @@ public sealed class CheckpointSnapshotTests : IDisposable
 
         var firstPage = _database.GetItems(checkpoint.Guid, ItemStatus.Updated, null, 0, 2);
 
-        // This update removes the first row from the live interval. Paging the live
-        // table with OFFSET would now skip the third row because every later row shifts.
+        // On the live table, this would shift page two past the third item.
         _database.SaveItems(new[] { Item(ids[0], checkpoint.Timestamp + 20) });
 
         var secondPage = _database.GetItems(checkpoint.Guid, ItemStatus.Updated, null, 2, 2);
