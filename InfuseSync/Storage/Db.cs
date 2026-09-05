@@ -201,6 +201,7 @@ namespace InfuseSync.Storage
                 using (var connection = CreateConnection(true))
                 {
                     var condition = ItemsCondition(itemTypes);
+                    // Break timestamp ties so pages keep the same order.
 #if EMBY
                     var sql = $"select * from {ItemsTable} where {condition} order by LastModified, Id limit @Limit OFFSET @Offset;";
 #else
@@ -299,6 +300,7 @@ namespace InfuseSync.Storage
                 using (var connection = CreateConnection(true))
                 {
                     var condition = UserInfoCondition(itemTypes);
+                    // User-data changes can share a timestamp too.
 #if EMBY
                     var sql = $"select * from {UserInfoTable} where {condition} order by LastModified, Id limit @Limit OFFSET @Offset;";
 #else
