@@ -131,6 +131,7 @@ namespace InfuseSync.Storage
                 throw new InvalidOperationException("The synchronization watermark is exhausted.");
             }
 
+            // Keep new changes ahead of the cursor if the clock moves back.
             var next = Math.Max(current + 1, _utcFileTime());
             using (var statement = connection.PrepareStatement(
                 $"update {WatermarkTable} set Value=@Value where Id=1;"))
