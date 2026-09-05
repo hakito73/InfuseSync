@@ -579,7 +579,7 @@ namespace InfuseSync.Storage
                 var itemsToSave = items.ToList();
                 if (setLastModified)
                 {
-                    // Checkpoint cursors use the same lock, so timestamp assignment must happen here.
+                    // Assign timestamps under the same lock as checkpoint creation.
                     var timestamp = DateTime.UtcNow.ToFileTime();
                     foreach (var item in itemsToSave)
                     {
@@ -634,7 +634,7 @@ namespace InfuseSync.Storage
                 var infoRecsToSave = infoRecs.ToList();
                 if (setLastModified)
                 {
-                    // Checkpoint cursors use the same lock, so timestamp assignment must happen here.
+                    // Assign timestamps under the same lock as checkpoint creation.
                     var timestamp = DateTime.UtcNow.ToFileTime();
                     foreach (var infoRec in infoRecsToSave)
                     {

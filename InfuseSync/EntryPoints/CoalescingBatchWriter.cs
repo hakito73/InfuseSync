@@ -49,6 +49,7 @@ namespace InfuseSync.EntryPoints
         private readonly long _timestampFrequency;
         private readonly Timer _timer;
 
+        // Unsaved changes are kept in memory, so they cannot survive a process exit.
         private Dictionary<TKey, TValue> _pending = new Dictionary<TKey, TValue>();
         private Batch _inFlight;
         private Task<Exception> _activeWrite;
@@ -413,7 +414,7 @@ namespace InfuseSync.EntryPoints
                 }
                 catch
                 {
-                    // Logging must not fault the writer.
+                    // A logging error should not stop retries.
                 }
             }
         }
