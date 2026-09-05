@@ -126,11 +126,10 @@ namespace InfuseSync.EntryPoints
                 return;
             }
 
-            // Keep the tombstone even if refreshing an affected library fails.
+            // Queue the removal before a library refresh can fail.
             ItemRemoved(e.Item);
 
-            // Removed folders are already empty, so refresh the containing library
-            // to capture changes that can no longer be discovered from the folder.
+            // The folder is already empty, so refresh its library.
             if (e.Item is Folder && ShouldRefreshAffectedLibraries(e.Item.GetClientTypeName()))
             {
                 try
