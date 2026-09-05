@@ -82,6 +82,7 @@ namespace InfuseSync.EntryPoints
         private void ItemUpdated(BaseItem item)
         {
 #if JELLYFIN
+            // Refresh the main video when one of its local versions changes.
             item = Shared.ResolveUpdatedItem(
                 item,
                 id => _libraryManager.GetItemById(id),
